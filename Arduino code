@@ -1,0 +1,129 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+
+#define TCRT5000_PIN A0
+#define AD8232_PIN A1
+
+PulseOximeter pox;
+
+float heartRate = 0.0;
+float spo2 = 0.0;
+
+int rawGlucoseValue = 0;
+float glucoseEstimate = 0.0;
+
+int ecgValue = 0;
+long lastDisplayTime = 0;
+const long displayInterval = 1000;
+
+#define R_PEAK_THRESHOLD 500
+bool beatDetected = false;
+long lastBeatTime = 0;
+
+const byte RR_INTERVAL_SIZE = 5;
+long rrIntervals[RR_INTERVAL_SIZE];
+byte rrSpot = 0;
+long averageRR = 0;
+
+const int RR_DEVIATION_THRESHOLD_PERCENT = 20;
+long lastArrhythmiaAlertTime = 0;
+const long ARRHYTHMIA_ALERT_COOLDOWN_MS = 5000;
+
+void onBeatDetected() {
+  heartRate = pox.getHeartRate();
+  spo2 = pox.getSpO2();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing MAX30105 sensor...");
+
+  if (!pox.begin()) {
+    Serial.println("MAX30105 sensor not found. Please check wiring!");
+    while (1);
+  } else {
+    Serial.println("MAX30105 sensor initialized successfully.");
+  }
+
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+
+  for (byte i = 0; i < RR_INTERVAL_SIZE; i++) {
+    rrIntervals[i] = 0;
+  }
+}
+
+void loop() {
+  pox.update();
+
+  rawGlucoseValue = analogRead(TCRT5000_PIN);
+  glucoseEstimate = constrain(rawGlucoseValue, 400, 800);
+  glucoseEstimate = map(glucoseEstimate, 400, 800, 60, 180);
+
+  ecgValue = analogRead(AD8232_PIN);
+
+  detectArrhythmia(ecgValue);
+
+  if (millis() - lastDisplayTime >= displayInterval) {
+    displayData();
+    lastDisplayTime = millis();
+  }
+}
+
+void detectArrhythmia(int ecg) {
+  if (ecg > R_PEAK_THRESHOLD && !beatDetected) {
+    long currentTime = millis();
+    if (lastBeatTime != 0) {
+      long currentRRInterval = currentTime - lastBeatTime;
+
+      rrIntervals[rrSpot] = currentRRInterval;
+      rrSpot = (rrSpot + 1) % RR_INTERVAL_SIZE;
+
+      long sumRR = 0;
+      int count = 0;
+      for (byte i = 0; i < RR_INTERVAL_SIZE; i++) {
+        if (rrIntervals[i] > 0) {
+          sumRR += rrIntervals[i];
+          count++;
+        }
+      }
+      if (count > 0) {
+        averageRR = sumRR / count;
+      }
+
+      if (count == RR_INTERVAL_SIZE && averageRR > 0) {
+        long deviation = abs(currentRRInterval - averageRR);
+        if (((float)deviation * 100.0) / averageRR > RR_DEVIATION_THRESHOLD_PERCENT) {
+          if (millis() - lastArrhythmiaAlertTime >= ARRHYTHMIA_ALERT_COOLDOWN_MS) {
+            Serial.println("!!! IRREGULAR RHYTHM ALERT !!!");
+            Serial.print("Current RR: "); Serial.print(currentRRInterval); Serial.print("ms, Avg RR: "); Serial.print(averageRR); Serial.println("ms");
+            lastArrhythmiaAlertTime = millis();
+          }
+        }
+      }
+    }
+    lastBeatTime = currentTime;
+    beatDetected = true;
+  } else if (ecg < (R_PEAK_THRESHOLD * 0.8)) {
+    beatDetected = false;
+  }
+}
+
+void displayData() {
+  Serial.println("------------------------------------");
+  Serial.print("Heart Rate: ");
+  Serial.print(heartRate);
+  Serial.println(" bpm");
+
+  Serial.print("SpO2: ");
+  Serial.print(spo2);
+  Serial.println(" %");
+
+  Serial.print("Raw Glucose: ");
+  Serial.print(rawGlucoseValue);
+  Serial.print(" -> Estimated Glucose: ");
+  Serial.print(glucoseEstimate);
+  Serial.println(" mg/dL");
+
+  Serial.print("ECG Value: ");
+  Serial.println(ecgValue);
+}
